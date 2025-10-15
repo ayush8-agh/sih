@@ -12,11 +12,18 @@ uint8_t serverAddress[] = {0xB8, 0xD6, 0x1A, 0xA7, 0x66, 0x88};
 #define DHTPIN 4
 #define DHTTYPE DHT22
 
-// MQ Sensor Configuration (Analog Pin)
-#define MQ_PIN 34
+// MQ Sensor Configuration (Analog Pin - Use ADC1 pins only: 32-39)
+// NOTE: ADC2 pins (0,2,4,12-15,25-27) don't work with WiFi!
+#define MQ_PIN 34  // GPIO34 is ADC1_CH6 - Safe to use with WiFi
 
 // Send data every 12 seconds
 const unsigned long SEND_INTERVAL = 12000;
+
+// WiFi Channel (1-13, match with receiver)
+#define WIFI_CHANNEL 1
+
+// Maximum retry attempts for ESP-NOW initialization
+#define MAX_INIT_RETRIES 3
 
 // ==================== DATA STRUCTURE ====================
 
@@ -47,7 +54,7 @@ int failureCount = 0;
  */
 String getMacAddress() {
   uint8_t mac[6];
-  WiFi.macAddress(mac);
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
   char macStr[18];
   snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -59,22 +66,41 @@ String getMacAddress() {
  */
 void readSensors() {
   // Read DHT22 Temperature & Humidity
-  sensorData.temperature = dht.readTemperature();
-  sensorData.humidity = dht.readHumidity();
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
   
   // Check if DHT reading failed
-  if (isnan(sensorData.temperature) || isnan(sensorData.humidity)) {
-    Serial.println("⚠️  DHT22 Read Failed! Using 0.0 as default.");
-    sensorData.temperature = 0.0;
-    sensorData.humidity = 0.0;
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("⚠️  DHT22 Read Failed! Using previous values or defaults.");
+    // Keep previous values if available, otherwise use defaults
+    if (sensorData.temperature == 0.0) {
+      sensorData.temperature = 25.0;  // Default room temperature
+      sensorData.humidity = 50.0;      // Default humidity
+    }
+  } else {
+    sensorData.temperature = temp;
+    sensorData.humidity = hum;
   }
   
   // Read MQ Gas Sensor (0-4095 for 12-bit ADC)
-  sensorData.mq_value = analogRead(MQ_PIN);
+  int mqRaw = analogRead(MQ_PIN);
   
-  // Simulated Heart Rate and SpO2 (replace with actual sensor if available)
-  sensorData.heartRate = 72.0 + random(-5, 5);
-  sensorData.spo2 = 98.0 + random(-2, 2);
+  // Validate ADC reading
+  if (mqRaw < 0 || mqRaw > 4095) {
+    Serial.println("⚠️  Invalid MQ sensor reading!");
+    sensorData.mq_value = 0;
+  } else {
+    sensorData.mq_value = mqRaw;
+  }
+  
+  // Simulated Heart Rate and SpO2 (replace with actual MAX30102 sensor if available)
+  // Realistic ranges: Heart Rate (60-100 bpm), SpO2 (95-100%)
+  sensorData.heartRate = 72.0 + (random(-10, 11) / 2.0);  // 67-77 bpm range
+  sensorData.spo2 = 97.5 + (random(-5, 6) / 2.0);         // 95-100% range
+  
+  // Clamp SpO2 to realistic range
+  if (sensorData.spo2 > 100.0) sensorData.spo2 = 100.0;
+  if (sensorData.spo2 < 90.0) sensorData.spo2 = 90.0;
   
   // Add timestamp
   sensorData.timestamp = millis();
@@ -87,7 +113,7 @@ void readSensors() {
   Serial.println("\n========== SENSOR READINGS ==========");
   Serial.printf("🌡️  Temperature : %.2f °C\n", sensorData.temperature);
   Serial.printf("💧 Humidity    : %.2f %%\n", sensorData.humidity);
-  Serial.printf("🌫️  Gas Level   : %d PPM\n", sensorData.mq_value);
+  Serial.printf("🌫️  Gas Level   : %d (Raw ADC)\n", sensorData.mq_value);
   Serial.printf("❤️  Heart Rate  : %.2f bpm\n", sensorData.heartRate);
   Serial.printf("🩺 SpO2        : %.2f %%\n", sensorData.spo2);
   Serial.printf("📱 MAC Address : %s\n", sensorData.mac);
@@ -107,19 +133,27 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     espNowConnected = true;
     successCount++;
     Serial.println("✅ Delivery Success");
-    Serial.printf("   Total Success: %d\n", successCount);
+    Serial.printf("   Total Success: %d | Failures: %d\n", successCount, failureCount);
   } else {
     espNowConnected = false;
     failureCount++;
     Serial.println("❌ Delivery Failed");
-    Serial.printf("   Total Failures: %d\n", failureCount);
+    Serial.printf("   Total Success: %d | Failures: %d\n", successCount, failureCount);
+    
+    // Attempt reconnection if multiple failures
+    if (failureCount % 5 == 0) {
+      Serial.println("⚠️  Multiple failures detected. Attempting ESP-NOW restart...");
+      esp_now_deinit();
+      delay(1000);
+      initESPNow();
+    }
   }
 }
 
 /**
  * @brief Initialize ESP-NOW protocol
  */
-void initESPNow() {
+bool initESPNow() {
   // Set device as Wi-Fi Station
   WiFi.mode(WIFI_STA);
   
@@ -127,31 +161,52 @@ void initESPNow() {
   WiFi.disconnect();
   delay(100);
   
-  Serial.println("\n📡 Initializing ESP-NOW...");
+  // Set WiFi channel
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
   
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("❌ ESP-NOW Initialization Failed!");
+  Serial.println("\n📡 Initializing ESP-NOW...");
+  Serial.printf("   WiFi Channel: %d\n", WIFI_CHANNEL);
+  
+  // Initialize ESP-NOW
+  esp_err_t initResult = esp_now_init();
+  if (initResult != ESP_OK) {
+    Serial.printf("❌ ESP-NOW Initialization Failed! Error: 0x%X\n", initResult);
     espNowConnected = false;
-    return;
+    return false;
   }
   
   Serial.println("✅ ESP-NOW Initialized Successfully");
   
   // Register send callback
-  esp_now_register_send_cb(OnDataSent);
+  esp_err_t callbackResult = esp_now_register_send_cb(OnDataSent);
+  if (callbackResult != ESP_OK) {
+    Serial.printf("❌ Failed to register send callback! Error: 0x%X\n", callbackResult);
+    return false;
+  }
   
   // Register peer (receiver)
   esp_now_peer_info_t peerInfo;
   memset(&peerInfo, 0, sizeof(peerInfo));
   memcpy(peerInfo.peer_addr, serverAddress, 6);
-  peerInfo.channel = 0;
+  peerInfo.channel = WIFI_CHANNEL;  // Must match the channel set above
   peerInfo.encrypt = false;
   peerInfo.ifidx = WIFI_IF_STA;
   
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("❌ Failed to Add Peer!");
+  // Check if peer already exists
+  if (esp_now_is_peer_exist(serverAddress)) {
+    Serial.println("⚠️  Peer already exists, removing...");
+    esp_now_del_peer(serverAddress);
+    delay(100);
+  }
+  
+  // Add peer
+  esp_err_t addPeerResult = esp_now_add_peer(&peerInfo);
+  if (addPeerResult != ESP_OK) {
+    Serial.printf("❌ Failed to Add Peer! Error: 0x%X\n", addPeerResult);
     espNowConnected = false;
-    return;
+    return false;
   }
   
   espNowConnected = true;
@@ -163,12 +218,19 @@ void initESPNow() {
            serverAddress[0], serverAddress[1], serverAddress[2],
            serverAddress[3], serverAddress[4], serverAddress[5]);
   Serial.printf("   Server MAC: %s\n", serverMAC);
+  
+  return true;
 }
 
 /**
  * @brief Send sensor data via ESP-NOW to receiver
  */
 void sendData() {
+  if (!espNowConnected) {
+    Serial.println("⚠️  ESP-NOW not connected! Skipping transmission...");
+    return;
+  }
+  
   Serial.println("\n📤 Sending data to receiver...");
   
   esp_err_t result = esp_now_send(serverAddress, (uint8_t *)&sensorData, sizeof(sensorData));
@@ -176,7 +238,7 @@ void sendData() {
   if (result == ESP_OK) {
     Serial.println("✅ Data queued for transmission");
   } else {
-    Serial.printf("❌ Error sending data (Error code: %d)\n", result);
+    Serial.printf("❌ Error sending data (Error code: 0x%X)\n", result);
     failureCount++;
   }
 }
@@ -191,31 +253,83 @@ void setup() {
   Serial.println("   ESP32 SENDER - DATA LOGGER");
   Serial.println("========================================\n");
   
+  // Initialize random seed for simulated sensor data
+  randomSeed(analogRead(0));
+  
   // Initialize DHT22 sensor
   dht.begin();
   Serial.println("✅ DHT22 Sensor Initialized");
   
+  // Wait for DHT22 to stabilize
+  Serial.println("⏳ Waiting for DHT22 to stabilize (2 seconds)...");
+  delay(2000);
+  
   // Configure MQ sensor pin
   pinMode(MQ_PIN, INPUT);
-  Serial.println("✅ MQ Sensor Pin Configured");
+  
+  // Configure ADC resolution (12-bit by default)
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);  // Full range: 0-3.3V
+  
+  Serial.println("✅ MQ Sensor Pin Configured (ADC1_CH6)");
+  Serial.println("   Note: Using GPIO34 (ADC1) - Safe with WiFi");
   
   // Print device MAC address
   Serial.println("\n📱 Device Information:");
   Serial.printf("   MAC Address: %s\n", getMacAddress().c_str());
+  Serial.printf("   WiFi Channel: %d\n", WIFI_CHANNEL);
   
-  // Initialize ESP-NOW
-  initESPNow();
+  // Initialize ESP-NOW with retry logic
+  bool initSuccess = false;
+  for (int attempt = 1; attempt <= MAX_INIT_RETRIES; attempt++) {
+    Serial.printf("\n🔄 ESP-NOW Init Attempt %d/%d\n", attempt, MAX_INIT_RETRIES);
+    
+    if (initESPNow()) {
+      initSuccess = true;
+      break;
+    }
+    
+    if (attempt < MAX_INIT_RETRIES) {
+      Serial.println("⏳ Retrying in 2 seconds...");
+      delay(2000);
+    }
+  }
+  
+  if (!initSuccess) {
+    Serial.println("\n❌❌❌ ESP-NOW INITIALIZATION FAILED AFTER ALL RETRIES ❌❌❌");
+    Serial.println("Please check:");
+    Serial.println("  1. Server MAC address is correct");
+    Serial.println("  2. Receiver is powered on and initialized");
+    Serial.println("  3. Both devices use the same WiFi channel");
+    Serial.println("\n⚠️  Device will continue but data transmission will fail!");
+  }
   
   Serial.println("\n========================================");
-  Serial.println("   SENDER READY!");
+  Serial.println(initSuccess ? "   SENDER READY!" : "   SENDER RUNNING (ESP-NOW FAILED)");
   Serial.println("========================================");
   Serial.printf("\n⏱️  Sending data every %lu seconds\n\n", SEND_INTERVAL / 1000);
+  
+  // Initialize sensor data structure with defaults
+  sensorData.temperature = 0.0;
+  sensorData.humidity = 0.0;
+  sensorData.mq_value = 0;
+  sensorData.heartRate = 0.0;
+  sensorData.spo2 = 0.0;
+  
+  // Perform initial sensor reading
+  Serial.println("📊 Performing initial sensor reading...");
+  readSensors();
 }
 
 // ==================== LOOP ====================
 
 void loop() {
   unsigned long currentTime = millis();
+  
+  // Handle millis() overflow (occurs after ~49 days)
+  if (currentTime < lastSendTime) {
+    lastSendTime = currentTime;
+  }
   
   // Check if it's time to send data
   if (currentTime - lastSendTime >= SEND_INTERVAL) {
@@ -226,8 +340,12 @@ void loop() {
     
     // Send data via ESP-NOW
     sendData();
+    
+    // Print connection status
+    Serial.printf("\n📊 Connection Status: %s\n", 
+                  espNowConnected ? "✅ Connected" : "❌ Disconnected");
   }
   
-  // Small delay for stability
+  // Small delay for stability and to prevent watchdog reset
   delay(50);
 }
